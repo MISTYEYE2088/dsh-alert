@@ -105,11 +105,37 @@ const main = { id: 'boot-check-main', header: { id: 'boot-check-main', cwd: 'C:/
 const child = { id: 'boot-check-child', header: { id: 'boot-check-child', origin: 'subagent', cwd: 'C:/work/demo' } }
 const at = (type, seq, data) => ({ type, seq, time: 1_700_000_000_000, data })
 
-ctx.emit('session/event', child, at('turn/end', 1, { turn: 1, reason: { kind: 'completed' } }))
-ctx.emit('session/event', main, at('turn/end', 2, { turn: 2, reason: { kind: 'completed' } }))
-ctx.emit('session/event', main, at('turn/end', 3, { turn: 3, reason: { kind: 'error', error: { message: 'boom' } } }))
-ctx.emit('session/event', main, at('turn/end', 4, { turn: 4, reason: { kind: 'aborted', reason: { kind: 'user' } } }))
-ctx.emit('session/event', main, at('compaction/end', 5, { compactionId: 'boot-check', turn: null }))
+// Topology matters, so model it exactly instead of using a root emit. In DSH the
+// session store is a SIBLING plugin, and it publishes through
+// `ctx.events.dispatch('emit', [carrier, 'session/event', session, event])`
+// (see collectSessionCallbacks in packages/core/session/src/index.ts), where the
+// carrier is a Scoped<Session> object. A plain `ctx.emit` on the root would pass
+// even if a sibling-to-sibling subscription were impossible, which is exactly the
+// failure this check exists to catch.
+let storeCtx
+const storePlugin = ctx.plugin({ name: 'boot-check-session-store', apply(storeContext) { storeCtx = storeContext } })
+if (storePlugin !== null && typeof storePlugin === 'object' && typeof storePlugin.then === 'function') await storePlugin
+await new Promise(resolve => setTimeout(resolve, 20))
+if (storeCtx === undefined) {
+  fail('could not mount the fake session store')
+} else {
+  pass('fake session store mounted as a sibling of the plugin')
+}
+const carrier = { name: 'boot-check-carrier' }
+function emitSessionEvent(session, event) {
+  const callbacks = storeCtx.events.dispatch('emit', [carrier, 'session/event', session, event])
+  for (const callback of callbacks) callback(session, event)
+  return callbacks.length
+}
+
+const delivered = emitSessionEvent(child, at('turn/end', 1, { turn: 1, reason: { kind: 'completed' } }))
+if (delivered === 0) fail('the sibling dispatch collected no listeners; session events would never reach the plugin')
+else pass('sibling dispatch collected ' + delivered + ' listener(s)')
+
+emitSessionEvent(main, at('turn/end', 2, { turn: 2, reason: { kind: 'completed' } }))
+emitSessionEvent(main, at('turn/end', 3, { turn: 3, reason: { kind: 'error', error: { message: 'boom' } } }))
+emitSessionEvent(main, at('turn/end', 4, { turn: 4, reason: { kind: 'aborted', reason: { kind: 'user' } } }))
+emitSessionEvent(main, at('compaction/end', 5, { compactionId: 'boot-check', turn: null }))
 
 await new Promise(resolve => setTimeout(resolve, 20))
 
@@ -134,8 +160,8 @@ const before = lines.filter(line => line.includes('dry-run')).length
 const configured = ctx.plugin(plugin, { alertOnAborted: true, alertOnCompaction: false, titlePrefix: 'PROBE' })
 if (configured !== null && typeof configured === 'object' && typeof configured.then === 'function') await configured
 await new Promise(resolve => setTimeout(resolve, 20))
-ctx.emit('session/event', main, at('turn/end', 6, { turn: 6, reason: { kind: 'aborted', reason: { kind: 'user' } } }))
-ctx.emit('session/event', main, at('compaction/end', 7, { compactionId: 'boot-check-2', turn: null }))
+emitSessionEvent(main, at('turn/end', 6, { turn: 6, reason: { kind: 'aborted', reason: { kind: 'user' } } }))
+emitSessionEvent(main, at('compaction/end', 7, { compactionId: 'boot-check-2', turn: null }))
 await new Promise(resolve => setTimeout(resolve, 20))
 const after = lines.filter(line => line.includes('dry-run')).length
 if (after - before !== 1) {
