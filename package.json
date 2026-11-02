@@ -1,7 +1,7 @@
 {
   "name": "dsh-alert",
-  "version": "0.2.0",
-  "description": "DeepSeek Harness web plugin: system notification and sound when an agent round or a context compaction finishes or fails.",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness plugin: a desktop notification and a sound when an agent round or a context compaction finishes or fails. Raised by the Harness process, so it does not depend on a browser tab.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,23 +15,28 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./notifier": "./notifier.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "notifier.js",
     "client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node tools/smoke.mjs"
+    "test": "node tools/smoke.mjs",
+    "test:boot": "node tools/boot-check.mjs",
+    "test:os": "node tools/probe-os.mjs"
   },
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
     "notification",
-    "alert"
+    "alert",
+    "toast"
   ],
   "dsh": {
     "client": {

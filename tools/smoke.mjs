@@ -1,12 +1,14 @@
-// Smoke checks for the dsh-alert browser half.
+// Smoke checks for dsh-alert.
 //
-// These run the real client.js — the same bytes the Host serves — inside a
-// hand-built browser and Cordis shell, then drive the Host events the plugin
-// listens to and count the alerts it produced. They are not a browser: they
-// cannot prove that Chrome lets a hidden tab post a notification or play a
-// tone. What they do prove is the part that used to break silently — which
-// event produces an alert, and how many alerts one round produces across a
-// replay, a refresh, and a resume.
+// Part A runs the Host half (index.js + notifier.js) against a fake Cordis
+// context and a recording notifier: it proves which session events raise an
+// alert, what the text says, and that the platform commands are built safely.
+//
+// Part B runs the real client.js inside a hand-built browser shell: it proves the
+// tab-title mark counts rounds and never touches notifications or audio.
+//
+// Neither part proves that your desktop shows the toast. `tools/probe-os.mjs`
+// does that, and is run on purpose rather than on every test run.
 //
 //   node tools/smoke.mjs
 //
@@ -14,9 +16,12 @@
 
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
+import { applyWith, describeSessionEvent } from '../index.js'
+import { buildOsascript, buildWindowsScript, createNotifier, encodePowerShellCommand } from '../notifier.js'
 
 const CLIENT = fileURLToPath(new URL('../client.js', import.meta.url))
-const source = await readFile(CLIENT, 'utf8')
+
+const tick = () => new Promise(resolve => setTimeout(resolve, 0))
 
 let failures = 0
 const results = []
@@ -27,141 +32,298 @@ function check(scenario, condition, detail) {
   throw new Error(scenario + ': ' + detail)
 }
 
-const tick = () => new Promise(resolve => setTimeout(resolve, 0))
-const settle = () => new Promise(resolve => setTimeout(resolve, 25))
+// ---------------------------------------------------------------------------
+// Part A: Host half
+// ---------------------------------------------------------------------------
 
-// A queue-backed async iterable, which is what session.follow() hands the
-// `for await` loop. Aborting the signal ends the iteration like a closed
-// transport does.
-function createStream() {
-  const queue = []
-  let waiting = null
-  let closed = false
-  const stream = {
-    push(frame) {
-      if (closed) return
-      if (waiting !== null) {
-        const resolve = waiting
-        waiting = null
-        resolve({ value: frame, done: false })
-        return
-      }
-      queue.push(frame)
+function createHostContext() {
+  const listeners = new Map()
+  const effects = []
+  const logs = []
+  return {
+    ctx: {
+      on(event, handler) {
+        if (!listeners.has(event)) listeners.set(event, new Set())
+        listeners.get(event).add(handler)
+        return () => { listeners.get(event).delete(handler) }
+      },
+      effect(factory) {
+        const cleanup = factory()
+        effects.push(cleanup)
+        return cleanup
+      },
+      get() {
+        return undefined
+      },
     },
-    close() {
-      if (closed) return
-      closed = true
-      if (waiting !== null) {
-        const resolve = waiting
-        waiting = null
-        resolve({ value: undefined, done: true })
-      }
+    emit(event, ...args) {
+      const handlers = listeners.get(event)
+      if (handlers !== undefined) for (const handler of [...handlers]) handler(...args)
     },
-    next() {
-      if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
-      if (closed) return Promise.resolve({ value: undefined, done: true })
-      return new Promise(resolve => { waiting = resolve })
-    },
-    return() {
-      stream.close()
-      return Promise.resolve({ value: undefined, done: true })
-    },
-    [Symbol.asyncIterator]() {
-      return stream
+    logs,
+    disposeAll() {
+      for (const cleanup of effects) if (typeof cleanup === 'function') cleanup()
     },
   }
-  return stream
 }
 
-// One disposable browser + shell. Every scenario builds its own, except where a
-// shared `storage` simulates a page refresh keeping localStorage.
-function createHarness(options = {}) {
-  const config = {
-    notificationPermission: 'granted',
-    audioState: 'running',
-    hidden: false,
-    storage: new Map(),
-    ...options,
+function createSink() {
+  const sent = []
+  return {
+    sent,
+    send(alert, switches) {
+      sent.push({ alert, switches })
+      return true
+    },
   }
+}
 
-  const notifications = []
-  const tones = []
-  const consoleLines = []
-  const titleHistory = []
-  const permissionRequests = { count: 0 }
-  const streams = []
-  const followSignals = []
-  const remote = new Map()
-  const shellEvents = new Map()
+function mainSession(extra = {}) {
+  return { id: 'session-main-0001', header: { id: 'session-main-0001', cwd: 'C:\\work\\demo', ...extra } }
+}
+
+function turnEnd(turn, reason) {
+  return { type: 'turn/end', seq: 7, time: 1_700_000_000_000, data: { turn, reason } }
+}
+
+function compactionEnd(extra = {}) {
+  return {
+    type: 'compaction/end',
+    seq: 9,
+    time: 1_700_000_000_000,
+    data: { compactionId: 'c1', turn: null, ...extra },
+  }
+}
+
+function hosted(config, sink) {
+  const host = createHostContext()
+  applyWith(host.ctx, config, {
+    notifier: sink,
+    log: () => {},
+    warn: () => {},
+  })
+  return host
+}
+
+const scenarios = []
+function scenario(name, run) {
+  scenarios.push({ name, run })
+}
+
+scenario('hostRoundCompleteAlerts', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  host.emit('session/event', mainSession(), turnEnd(3, { kind: 'completed' }))
+  check('hostRoundCompleteAlerts', sink.sent.length === 1, 'expected 1 alert, got ' + sink.sent.length)
+  const { alert } = sink.sent[0]
+  check('hostRoundCompleteAlerts', alert.failed === false, 'a completed round was reported as failed')
+  check('hostRoundCompleteAlerts', alert.title === 'DSH · Round complete', 'unexpected title ' + alert.title)
+  check('hostRoundCompleteAlerts', alert.body === 'demo · turn 3', 'unexpected body ' + alert.body)
+})
+
+scenario('hostSubagentIgnored', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  host.emit('session/event', { id: 'session-agent-0002', header: { id: 'session-agent-0002', origin: 'subagent', cwd: 'C:\\work\\demo' } }, turnEnd(1, { kind: 'completed' }))
+  check('hostSubagentIgnored', sink.sent.length === 0, 'a subagent round alerted')
+})
+
+scenario('hostErrorAlertsWithMessage', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  host.emit('session/event', mainSession(), turnEnd(2, { kind: 'error', error: { message: 'provider returned 500', code: 'HTTP_500' } }))
+  check('hostErrorAlertsWithMessage', sink.sent.length === 1, 'expected 1 alert')
+  const { alert } = sink.sent[0]
+  check('hostErrorAlertsWithMessage', alert.failed === true, 'the failure was not marked')
+  check('hostErrorAlertsWithMessage', alert.title === 'DSH · Round failed', 'unexpected title ' + alert.title)
+  check('hostErrorAlertsWithMessage', alert.body.includes('provider returned 500'), 'the error text is missing: ' + alert.body)
+})
+
+scenario('hostAbortedSilentByDefault', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  host.emit('session/event', mainSession(), turnEnd(4, { kind: 'aborted', reason: { kind: 'user' } }))
+  check('hostAbortedSilentByDefault', sink.sent.length === 0, 'a cancelled round alerted')
+})
+
+scenario('hostAbortedWhenEnabled', async () => {
+  const sink = createSink()
+  const host = hosted({ alertOnAborted: true }, sink)
+  host.emit('session/event', mainSession(), turnEnd(4, { kind: 'aborted', reason: { kind: 'user' } }))
+  check('hostAbortedWhenEnabled', sink.sent.length === 1, 'alertOnAborted did not opt in')
+  check('hostAbortedWhenEnabled', sink.sent[0].alert.title === 'DSH · Round cancelled',
+    'unexpected title ' + sink.sent[0].alert.title)
+})
+
+scenario('hostBookkeepingReasonsSilent', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  for (const kind of ['interrupted', 'forked', 'blocked']) {
+    host.emit('session/event', mainSession(), turnEnd(5, { kind }))
+  }
+  check('hostBookkeepingReasonsSilent', sink.sent.length === 0,
+    'a bookkeeping reason alerted: ' + JSON.stringify(sink.sent.map(entry => entry.alert.title)))
+})
+
+scenario('hostCompactionAlerts', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  host.emit('session/event', mainSession(), compactionEnd())
+  check('hostCompactionAlerts', sink.sent.length === 1, 'expected one compaction alert')
+  check('hostCompactionAlerts', sink.sent[0].alert.title === 'DSH · Context compacted',
+    'unexpected title ' + sink.sent[0].alert.title)
+})
+
+scenario('hostCompactionFailureShowsError', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  host.emit('session/event', mainSession(), compactionEnd({ error: 'summary record rejected' }))
+  check('hostCompactionFailureShowsError', sink.sent[0].alert.failed === true, 'the failure was not marked')
+  check('hostCompactionFailureShowsError', sink.sent[0].alert.body.includes('summary record rejected'),
+    'the error text is missing: ' + sink.sent[0].alert.body)
+})
+
+scenario('hostCompactionCanBeDisabled', async () => {
+  const sink = createSink()
+  const host = hosted({ alertOnCompaction: false }, sink)
+  host.emit('session/event', mainSession(), compactionEnd())
+  check('hostCompactionCanBeDisabled', sink.sent.length === 0, 'compaction alerted while disabled')
+})
+
+scenario('hostDuplicateEventAlertsOnce', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  const event = turnEnd(6, { kind: 'completed' })
+  host.emit('session/event', mainSession(), event)
+  host.emit('session/event', mainSession(), event)
+  check('hostDuplicateEventAlertsOnce', sink.sent.length === 1,
+    'the same committed event alerted twice, got ' + sink.sent.length)
+})
+
+scenario('hostDisabledSendsNothing', async () => {
+  const sink = createSink()
+  const host = hosted({ enabled: false }, sink)
+  host.emit('session/event', mainSession(), turnEnd(1, { kind: 'completed' }))
+  check('hostDisabledSendsNothing', sink.sent.length === 0, 'a disabled plugin alerted')
+})
+
+scenario('hostSwitchesReachTheNotifier', async () => {
+  const sink = createSink()
+  const host = hosted({ notify: false, sound: true }, sink)
+  host.emit('session/event', mainSession(), turnEnd(1, { kind: 'completed' }))
+  check('hostSwitchesReachTheNotifier', sink.sent[0].switches.notify === false, 'notify: false was not forwarded')
+  check('hostSwitchesReachTheNotifier', sink.sent[0].switches.sound === true, 'sound: true was not forwarded')
+})
+
+scenario('hostTeardownUnsubscribes', async () => {
+  const sink = createSink()
+  const host = hosted(undefined, sink)
+  host.disposeAll()
+  host.emit('session/event', mainSession(), turnEnd(1, { kind: 'completed' }))
+  check('hostTeardownUnsubscribes', sink.sent.length === 0, 'an event still alerted after teardown')
+})
+
+scenario('hostLabelFallsBackToSessionId', async () => {
+  const alert = describeSessionEvent({ id: 'abcdef0123456789', header: {} }, turnEnd(1, { kind: 'completed' }))
+  check('hostLabelFallsBackToSessionId', alert.body.startsWith('session abcdef01 · turn 1'),
+    'unexpected body ' + alert.body)
+})
+
+// --- notifier command construction -----------------------------------------
+
+scenario('windowsScriptEscapesHostileText', async () => {
+  const script = buildWindowsScript({ title: "A & B <'x'>", body: 'say "hi" & <bye>' }, { sound: true })
+  check('windowsScriptEscapesHostileText', script.includes('A &amp; B &lt;&apos;x&apos;&gt;'),
+    'the title was not XML-escaped:\n' + script)
+  check('windowsScriptEscapesHostileText', script.includes('say &quot;hi&quot; &amp; &lt;bye&gt;'),
+    'the body was not XML-escaped:\n' + script)
+  check('windowsScriptEscapesHostileText', script.includes('Windows.UI.Notifications.ToastNotificationManager'),
+    'the toast API is missing')
+  check('windowsScriptEscapesHostileText', !script.includes("'x'"), 'an unescaped PowerShell quote survived')
+})
+
+scenario('windowsScriptSoundSwitch', async () => {
+  const loud = buildWindowsScript({ title: 't', body: 'b' }, { sound: true })
+  const quiet = buildWindowsScript({ title: 't', body: 'b' }, { sound: false })
+  check('windowsScriptSoundSwitch', loud.includes('ms-winsoundevent:Notification.Default'), 'the loud script has no audio')
+  check('windowsScriptSoundSwitch', quiet.includes('<audio silent="true" />'), 'the quiet script is not silent')
+  check('windowsScriptSoundSwitch', quiet.includes('$sound = $false'), 'the quiet script still uses SoundPlayer')
+})
+
+scenario('osascriptEscapesHostileText', async () => {
+  const script = buildOsascript({ title: 'A "B"', body: 'C \\ D', failed: true }, { sound: true })
+  check('osascriptEscapesHostileText', script.includes('"A \\"B\\""'), 'the title was not escaped: ' + script)
+  check('osascriptEscapesHostileText', script.includes('"C \\\\ D"'), 'the body was not escaped: ' + script)
+  check('osascriptEscapesHostileText', script.includes('sound name "Basso"'), 'a failed round used the wrong sound')
+})
+
+scenario('notifierRunsPowerShellOnWindows', async () => {
+  const calls = []
+  const notifier = createNotifier({
+    platform: 'win32',
+    warn: () => {},
+    exists: () => true,
+    spawn: (command, args) => {
+      calls.push({ command, args })
+      return { on() {}, kill() {}, unref() {} }
+    },
+  })
+  notifier.send({ title: 'DSH · Round complete', body: 'demo · turn 1' })
+  check('notifierRunsPowerShellOnWindows', calls.length === 1, 'expected one spawn, got ' + calls.length)
+  check('notifierRunsPowerShellOnWindows', /powershell\.exe$/i.test(calls[0].command), 'wrong command ' + calls[0].command)
+  const encoded = calls[0].args[calls[0].args.indexOf('-EncodedCommand') + 1]
+  const script = Buffer.from(encoded, 'base64').toString('utf16le')
+  check('notifierRunsPowerShellOnWindows', script.includes('DSH · Round complete'),
+    'the title did not survive the encoding:\n' + script)
+  check('notifierRunsPowerShellOnWindows', calls[0].args.includes('-NonInteractive'), 'the shell could block on input')
+})
+
+scenario('notifierReportsUnsupportedPlatformOnce', async () => {
+  const warnings = []
+  const notifier = createNotifier({ platform: 'freebsd', warn: message => warnings.push(message) })
+  const first = notifier.send({ title: 'a', body: 'b' })
+  notifier.send({ title: 'a', body: 'b' })
+  check('notifierReportsUnsupportedPlatformOnce', first === false, 'an unsupported platform claimed success')
+  check('notifierReportsUnsupportedPlatformOnce', warnings.length === 1,
+    'expected exactly one warning, got ' + warnings.length)
+})
+
+scenario('notifierSurvivesSpawnFailure', async () => {
+  const warnings = []
+  const notifier = createNotifier({
+    platform: 'linux',
+    warn: message => warnings.push(message),
+    spawn: () => { throw new Error('ENOENT') },
+  })
+  const started = notifier.send({ title: 'a', body: 'b' }, { sound: false })
+  check('notifierSurvivesSpawnFailure', started === false, 'a failed spawn claimed success')
+  check('notifierSurvivesSpawnFailure', warnings.length >= 1, 'a failed spawn was silent')
+})
+
+scenario('encodedCommandIsUtf16Base64', async () => {
+  const encoded = encodePowerShellCommand('Write-Output "ok"')
+  check('encodedCommandIsUtf16Base64', Buffer.from(encoded, 'base64').toString('utf16le') === 'Write-Output "ok"',
+    'the encoding round trip failed')
+})
+
+// ---------------------------------------------------------------------------
+// Part B: browser half
+// ---------------------------------------------------------------------------
+
+const clientSource = await readFile(CLIENT, 'utf8')
+
+function createBrowserHarness(options = {}) {
+  const config = { hidden: false, ...options }
   const documentHandlers = new Map()
   const windowHandlers = new Map()
-  const lockRequests = []
-  const lockReleases = []
-  const effects = []
   const registrations = []
-
+  const consoleLines = []
   let title = 'DSH'
   let hidden = config.hidden
-  let audioContext = null
-
-  const localStorage = {
-    getItem(key) {
-      return config.storage.has(key) ? config.storage.get(key) : null
-    },
-    setItem(key, value) {
-      config.storage.set(key, String(value))
-    },
-  }
-
-  class FakeNotification {
-    constructor(alertTitle, alertOptions) {
-      notifications.push({ title: alertTitle, options: alertOptions !== null && alertOptions !== undefined ? alertOptions : {} })
-    }
-  }
-  FakeNotification.permission = config.notificationPermission
-  FakeNotification.requestPermission = () => {
-    permissionRequests.count += 1
-    FakeNotification.permission = 'granted'
-    return Promise.resolve('granted')
-  }
-
-  class FakeAudioContext {
-    constructor() {
-      this.state = config.audioState
-      this.currentTime = 1.5
-      this.destination = { name: 'destination' }
-      this.resumeCalls = 0
-      audioContext = this
-    }
-
-    resume() {
-      this.resumeCalls += 1
-      this.state = 'running'
-      return Promise.resolve()
-    }
-
-    createOscillator() {
-      const oscillator = {
-        type: 'sine',
-        frequency: { value: 0 },
-        connect() {},
-        start(at) { tones.push({ frequency: oscillator.frequency.value, at }) },
-        stop() {},
-      }
-      return oscillator
-    }
-
-    createGain() {
-      return {
-        gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} },
-        connect() {},
-      }
-    }
-  }
 
   const document = {
     get title() { return title },
-    set title(value) { title = value; titleHistory.push(value) },
+    set title(value) { title = value },
     get hidden() { return hidden },
     addEventListener(type, handler) {
       if (!documentHandlers.has(type)) documentHandlers.set(type, new Set())
@@ -174,9 +336,7 @@ function createHarness(options = {}) {
   }
 
   const window = {
-    __ModuleLoader__: {
-      load(registration) { registrations.push(registration) },
-    },
+    __ModuleLoader__: { load(registration) { registrations.push(registration) } },
     addEventListener(type, handler) {
       if (!windowHandlers.has(type)) windowHandlers.set(type, new Set())
       windowHandlers.get(type).add(handler)
@@ -187,46 +347,23 @@ function createHarness(options = {}) {
     },
   }
 
-  const navigator = {
-    locks: {
-      request(name, _options, callback) {
-        lockRequests.push(name)
-        const result = callback()
-        return Promise.resolve(result).then(() => { lockReleases.push(name) })
-      },
-    },
-  }
-
   const quietConsole = {
     info: (...args) => consoleLines.push({ level: 'info', args }),
     warn: (...args) => consoleLines.push({ level: 'warn', args }),
     error: (...args) => consoleLines.push({ level: 'error', args }),
   }
 
+  const listeners = new Map()
+  const effects = []
   const ctx = {
     remote: {
       $on(event, handler) {
-        if (!remote.has(event)) remote.set(event, new Set())
-        remote.get(event).add(handler)
-        return () => { remote.get(event).delete(handler) }
-      },
-      session: {
-        follow(args, signal) {
-          const stream = createStream()
-          streams.push({ sessionId: args.address.sessionId, stream })
-          followSignals.push(signal)
-          if (signal !== undefined) {
-            signal.addEventListener('abort', () => { stream.close() })
-          }
-          return stream
-        },
+        if (!listeners.has(event)) listeners.set(event, new Set())
+        listeners.get(event).add(handler)
+        return () => { listeners.get(event).delete(handler) }
       },
     },
-    on(event, handler) {
-      if (!shellEvents.has(event)) shellEvents.set(event, new Set())
-      shellEvents.get(event).add(handler)
-      return () => { shellEvents.get(event).delete(handler) }
-    },
+    on() { return () => {} },
     effect(factory) {
       const cleanup = factory()
       effects.push(cleanup)
@@ -235,384 +372,108 @@ function createHarness(options = {}) {
   }
 
   function emit(event, ...args) {
-    const handlers = remote.get(event)
+    const handlers = listeners.get(event)
     if (handlers !== undefined) for (const handler of [...handlers]) handler(...args)
-  }
-
-  function emitShell(event, ...args) {
-    const handlers = shellEvents.get(event)
-    if (handlers !== undefined) for (const handler of [...handlers]) handler(...args)
-  }
-
-  function fireDocument(type) {
-    const handlers = documentHandlers.get(type)
-    if (handlers !== undefined) for (const handler of [...handlers]) handler({ type })
-  }
-
-  function fireWindow(type) {
-    const handlers = windowHandlers.get(type)
-    if (handlers !== undefined) for (const handler of [...handlers]) handler({ type })
   }
 
   function setHidden(next) {
     hidden = next
-    fireDocument('visibilitychange')
+    const handlers = documentHandlers.get('visibilitychange')
+    if (handlers !== undefined) for (const handler of [...handlers]) handler({ type: 'visibilitychange' })
   }
 
   function load() {
-    // new Function parses the source exactly like a classic script and keeps
-    // top-level `window` / `document` names resolvable as parameters.
-    const evaluate = new Function(
-      'window', 'document', 'Notification', 'AudioContext', 'localStorage', 'navigator',
-      'console', 'setTimeout', 'clearTimeout', source,
-    )
-    evaluate(window, document, FakeNotification, FakeAudioContext, localStorage, navigator, quietConsole, setTimeout, clearTimeout)
-    check('registration', registrations.length === 1, 'expected exactly one __ModuleLoader__.load registration, got ' + registrations.length)
+    const evaluate = new Function('window', 'document', 'console', clientSource)
+    evaluate(window, document, quietConsole)
+    check('registration', registrations.length === 1, 'expected one client registration, got ' + registrations.length)
     const registration = registrations[0]
     check('registration', registration.id === 'dsh-alert', 'module id is ' + String(registration.id))
     const module = registration.factory(() => { throw new Error('unexpected require') })
     check('registration', typeof module.apply === 'function', 'apply is not exported')
-    check('registration', Array.isArray(module.inject) && module.inject.includes('remote.session'),
-      'inject must contain remote.session; got ' + JSON.stringify(module.inject))
+    check('registration', Array.isArray(module.inject) && module.inject.includes('remote'),
+      'inject must contain remote; got ' + JSON.stringify(module.inject))
+    check('registration', !module.inject.includes('remote.session'),
+      'the title-mark half must not inject remote.session')
     module.apply(ctx)
     return module
   }
 
-  // Wait for the follow stream of one session (or the newest one when the
-  // scenario only ever watches a single session).
-  async function waitForStream(sessionId) {
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const match = sessionId === undefined
-        ? streams[streams.length - 1]
-        : streams.find(entry => entry.sessionId === sessionId)
-      if (match !== undefined) return match
-      await tick()
-    }
-    throw new Error('no follow stream was opened for ' + String(sessionId))
-  }
-
   return {
-    config,
-    notifications,
-    tones,
-    consoleLines,
-    titleHistory,
-    permissionRequests,
-    streams,
-    followSignals,
-    lockRequests,
-    lockReleases,
-    effects,
-    document,
-    window,
     get title() { return title },
-    get audioContext() { return audioContext },
-    emit,
-    emitShell,
-    fireDocument,
-    fireWindow,
+    consoleLines,
     setHidden,
     load,
-    waitForStream,
-    storage: config.storage,
+    emit,
+    disposeAll() { for (const cleanup of effects) if (typeof cleanup === 'function') cleanup() },
+    get api() { return window.dshAlert },
   }
 }
 
-const MAIN = 'session-main-0001'
-const SUBAGENT = 'session-agent-0002'
+scenario('titleMarkOnlyWhenHidden', async () => {
+  const browser = createBrowserHarness({ hidden: false })
+  browser.load()
+  browser.emit('api-session/added', { sessionId: 's1', cwd: 'C:\\work\\demo' })
+  browser.emit('api-session/status', 's1', true)
+  browser.emit('api-session/status', 's1', false)
+  check('titleMarkOnlyWhenHidden', browser.title === 'DSH', 'a visible tab was marked: ' + browser.title)
 
-function summary(sessionId, extra) {
-  return { sessionId, agentAvailable: true, updatedAt: 1, running: false, blank: false, cwd: 'C:\\work\\demo', ...extra }
-}
-
-function turnEnd(seq, time, kind, error) {
-  return {
-    type: 'event',
-    event: {
-      type: 'turn/end',
-      seq,
-      time,
-      data: { turn: 1, reason: kind === 'error' ? { kind, error: { message: error } } : { kind } },
-    },
-  }
-}
-
-function compactionEnd(seq, time, error) {
-  return {
-    type: 'event',
-    event: {
-      type: 'compaction/end',
-      seq,
-      time,
-      data: error === undefined ? { compactionId: 'c1' } : { compactionId: 'c1', error },
-    },
-  }
-}
-
-const scenarios = []
-function scenario(name, run) {
-  scenarios.push({ name, run })
-}
-
-// Normal use: one completed round, observed while the tab is in the background.
-scenario('roundCompleteAlertsOnce', async () => {
-  const harness = createHarness({ hidden: true })
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const { stream } = await harness.waitForStream()
-  stream.push({ type: 'snapshot', records: [] })
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  stream.push(turnEnd(5, Date.now(), 'completed'))
-  await settle()
-  harness.emit('api-session/status', MAIN, false)
-  await settle()
-  await settle()
-
-  check('roundCompleteAlertsOnce', harness.notifications.length === 1,
-    'expected 1 notification, got ' + harness.notifications.length)
-  check('roundCompleteAlertsOnce', harness.notifications[0].title.includes('complete'),
-    'unexpected title ' + harness.notifications[0].title)
-  check('roundCompleteAlertsOnce', harness.tones.length === 2,
-    'expected 2 tone notes, got ' + harness.tones.length)
-  check('roundCompleteAlertsOnce', harness.title.startsWith('(1)'), 'hidden tab title was not marked: ' + harness.title)
-  // Returning to the tab clears the mark without a second alert.
-  harness.setHidden(false)
-  await settle()
-  check('roundCompleteAlertsOnce', harness.title === 'DSH', 'title mark was not restored: ' + harness.title)
-  check('roundCompleteAlertsOnce', harness.notifications.length === 1, 'returning to the tab alerted again')
+  browser.setHidden(true)
+  browser.emit('api-session/status', 's1', true)
+  browser.emit('api-session/status', 's1', false)
+  check('titleMarkOnlyWhenHidden', browser.title === '(1) DSH', 'a hidden tab was not marked: ' + browser.title)
 })
 
-// Repeat: the same round reported twice (turn/end then the status edge) must
-// deliver exactly one alert.
-scenario('secondRoundWithinSuppressionIsDropped', async () => {
-  const harness = createHarness()
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const { stream } = await harness.waitForStream()
-  stream.push({ type: 'snapshot', records: [] })
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  stream.push(turnEnd(5, Date.now(), 'completed'))
-  stream.push(turnEnd(6, Date.now() + 10, 'completed'))
-  await settle()
-  check('secondRoundWithinSuppressionIsDropped', harness.notifications.length === 1,
-    'expected the second report to be suppressed, got ' + harness.notifications.length)
+scenario('twoUnreadRoundsKeepOnePrefix', async () => {
+  const browser = createBrowserHarness({ hidden: true })
+  browser.load()
+  browser.emit('api-session/added', { sessionId: 's1', cwd: 'C:\\work\\demo' })
+  browser.emit('api-session/status', 's1', true)
+  browser.emit('api-session/status', 's1', false)
+  browser.emit('api-session/status', 's1', true)
+  browser.emit('api-session/status', 's1', false)
+  check('twoUnreadRoundsKeepOnePrefix', browser.title === '(2) DSH', 'title was not a counted prefix: ' + browser.title)
+  browser.setHidden(false)
+  check('twoUnreadRoundsKeepOnePrefix', browser.title === 'DSH', 'the mark was not cleared on return: ' + browser.title)
 })
 
-// Restart: a reconnect replays the session tail. The replayed turn/end must not
-// alert again, and must not move the watermark backwards.
-scenario('replayedTurnEndDoesNotAlert', async () => {
-  const harness = createHarness()
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const first = await harness.waitForStream()
-  first.stream.push({ type: 'snapshot', records: [] })
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  first.stream.push(turnEnd(5, Date.now(), 'completed'))
-  await settle()
-  check('replayedTurnEndDoesNotAlert', harness.notifications.length === 1,
-    'the live round did not alert')
-
-  harness.emitShell('connection/reset')
-  const second = await harness.waitForStream()
-  check('replayedTurnEndDoesNotAlert', second !== first, 'the follow stream was not re-opened')
-  const replayAt = Date.now() - 1000
-  second.stream.push({ type: 'snapshot', records: [turnEnd(5, replayAt, 'completed')] })
-  await settle()
-  check('replayedTurnEndDoesNotAlert', harness.notifications.length === 1,
-    'the replayed turn/end alerted again')
+scenario('subagentSessionDoesNotMark', async () => {
+  const browser = createBrowserHarness({ hidden: true })
+  browser.load()
+  browser.emit('api-session/added', { sessionId: 's2', origin: 'subagent', cwd: 'C:\\work\\demo' })
+  browser.emit('api-session/status', 's2', true)
+  browser.emit('api-session/status', 's2', false)
+  check('subagentSessionDoesNotMark', browser.title === 'DSH', 'a subagent round marked the tab: ' + browser.title)
 })
 
-// A snapshot that proves a round finished while the page could not observe it
-// alerts once — the catch-up path after a frozen tab or a lost connection.
-scenario('snapshotCatchUpAlertsOnce', async () => {
-  const storage = new Map()
-  storage.set('dsh-alert/v1/marks', JSON.stringify({ v: 1, sessions: { [MAIN]: { turnSeq: 5, turnAt: 1, edgeAt: 1 } } }))
-  const harness = createHarness({ storage })
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const { stream } = await harness.waitForStream()
-  stream.push({ type: 'snapshot', records: [turnEnd(9, Date.now(), 'completed')] })
-  await settle()
-  check('snapshotCatchUpAlertsOnce', harness.notifications.length === 1,
-    'expected exactly one catch-up alert, got ' + harness.notifications.length)
-
-  harness.emitShell('connection/reset')
-  const second = await harness.waitForStream()
-  second.stream.push({ type: 'snapshot', records: [turnEnd(9, Date.now(), 'completed')] })
-  await settle()
-  check('snapshotCatchUpAlertsOnce', harness.notifications.length === 1,
-    'the same snapshot alerted a second time')
+scenario('unknownSessionIsReportedNotMarked', async () => {
+  const browser = createBrowserHarness({ hidden: true })
+  browser.load()
+  browser.emit('api-session/status', 's3', true)
+  browser.emit('api-session/status', 's3', false)
+  check('unknownSessionIsReportedNotMarked', browser.title === 'DSH', 'an unidentified session marked the tab')
+  const warned = browser.consoleLines.some(line => line.level === 'warn' && String(line.args[1]).includes('never announced'))
+  check('unknownSessionIsReportedNotMarked', warned, 'an unidentified session was dropped silently')
 })
 
-// On a fresh profile the first snapshot is a baseline, not news: a session last
-// used yesterday must not alert when the page loads.
-scenario('firstLoadSnapshotIsBaseline', async () => {
-  const harness = createHarness()
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const { stream } = await harness.waitForStream()
-  stream.push({ type: 'snapshot', records: [turnEnd(40, Date.now() - 86400000, 'completed')] })
-  await settle()
-  check('firstLoadSnapshotIsBaseline', harness.notifications.length === 0,
-    'a historical turn alerted on first sight')
-  const marks = JSON.parse(harness.storage.get('dsh-alert/v1/marks'))
-  check('firstLoadSnapshotIsBaseline', marks.sessions[MAIN].turnSeq === 40,
-    'the baseline watermark was not adopted: ' + JSON.stringify(marks.sessions[MAIN]))
+scenario('baselineStatusDoesNotMark', async () => {
+  const browser = createBrowserHarness({ hidden: true })
+  browser.load()
+  browser.emit('api-session/added', { sessionId: 's4', cwd: 'C:\\work\\demo' })
+  browser.emit('api-session/status', 's4', false)
+  check('baselineStatusDoesNotMark', browser.title === 'DSH', 'the first status of a session marked the tab')
 })
 
-// Failure: the error event explains why, even when no turn/end frame arrives.
-scenario('errorMessageExplainsFailure', async () => {
-  const harness = createHarness()
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  await harness.waitForStream()
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  harness.emit('api-session/error', MAIN, 'provider returned 500')
-  harness.emit('api-session/status', MAIN, false)
-  await settle()
-  await new Promise(resolve => setTimeout(resolve, 650))
-  check('errorMessageExplainsFailure', harness.notifications.length === 1,
-    'expected one failure alert, got ' + harness.notifications.length)
-  check('errorMessageExplainsFailure', harness.notifications[0].title.includes('failed'),
-    'unexpected title ' + harness.notifications[0].title)
-  check('errorMessageExplainsFailure', (harness.notifications[0].options.body || '').includes('provider returned 500'),
-    'the error message was not reported: ' + harness.notifications[0].options.body)
+scenario('clientTeardownUnsubscribes', async () => {
+  const browser = createBrowserHarness({ hidden: true })
+  browser.load()
+  browser.emit('api-session/added', { sessionId: 's5', cwd: 'C:\\work\\demo' })
+  browser.disposeAll()
+  browser.emit('api-session/status', 's5', true)
+  browser.emit('api-session/status', 's5', false)
+  check('clientTeardownUnsubscribes', browser.title === 'DSH', 'an event still marked the tab after teardown')
 })
 
-// A user-cancelled round is not news: the user is at the page and pressed stop.
-scenario('abortedTurnIsSilent', async () => {
-  const harness = createHarness()
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const { stream } = await harness.waitForStream()
-  stream.push({ type: 'snapshot', records: [] })
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  stream.push(turnEnd(7, Date.now(), 'aborted'))
-  await settle()
-  harness.emit('api-session/status', MAIN, false)
-  await new Promise(resolve => setTimeout(resolve, 650))
-  check('abortedTurnIsSilent', harness.notifications.length === 0,
-    'an aborted turn alerted')
-})
-
-// Subagent rounds must never alert.
-scenario('subagentIsIgnored', async () => {
-  const harness = createHarness()
-  harness.load()
-  harness.emit('api-session/added', summary(SUBAGENT, { origin: 'subagent' }))
-  await settle()
-  harness.emit('api-session/status', SUBAGENT, true)
-  await settle()
-  harness.emit('api-session/status', SUBAGENT, false)
-  await new Promise(resolve => setTimeout(resolve, 650))
-  check('subagentIsIgnored', harness.notifications.length === 0, 'a subagent round alerted')
-  check('subagentIsIgnored', harness.streams.length === 0, 'a subagent session was followed')
-})
-
-// Audio policy: a suspended context is not scheduled, because queued tones are
-// heard only when the user returns to the tab — the original bug.
-scenario('suspendedContextDoesNotQueueTone', async () => {
-  const harness = createHarness({ audioState: 'suspended' })
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const { stream } = await harness.waitForStream()
-  stream.push({ type: 'snapshot', records: [] })
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  stream.push(turnEnd(5, Date.now(), 'completed'))
-  await settle()
-  check('suspendedContextDoesNotQueueTone', harness.tones.length === 0,
-    'a tone was queued on a suspended context: ' + JSON.stringify(harness.tones))
-  check('suspendedContextDoesNotQueueTone', harness.notifications.length === 1,
-    'the notification did not cover the silent tone')
-})
-
-// The unread mark counts alerts instead of nesting prefixes.
-scenario('twoUnreadAlertsKeepOnePrefix', async () => {
-  const OTHER = 'session-main-0003'
-  const harness = createHarness({ hidden: true })
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  harness.emit('api-session/added', summary(OTHER))
-  const main = await harness.waitForStream(MAIN)
-  const other = await harness.waitForStream(OTHER)
-  main.stream.push({ type: 'snapshot', records: [] })
-  other.stream.push({ type: 'snapshot', records: [] })
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  main.stream.push(turnEnd(5, Date.now(), 'completed'))
-  await settle()
-  harness.emit('api-session/status', OTHER, true)
-  await settle()
-  other.stream.push(turnEnd(6, Date.now() + 5, 'completed'))
-  await settle()
-  check('twoUnreadAlertsKeepOnePrefix', harness.notifications.length === 2,
-    'expected two alerts from two sessions, got ' + harness.notifications.length)
-  check('twoUnreadAlertsKeepOnePrefix', harness.title === '(2) DSH',
-    'title was not a single counted prefix: ' + harness.title)
-  harness.setHidden(false)
-  await settle()
-  check('twoUnreadAlertsKeepOnePrefix', harness.title === 'DSH', 'title was not restored: ' + harness.title)
-})
-
-// The keep-alive lock is held only while hidden with work in flight.
-scenario('keepaliveLockHeldWhileHiddenRunning', async () => {
-  const harness = createHarness({ hidden: true })
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  await harness.waitForStream()
-  harness.emit('api-session/status', MAIN, true)
-  await settle()
-  check('keepaliveLockHeldWhileHiddenRunning', harness.lockRequests.length === 1,
-    'no keep-alive lock was requested, got ' + harness.lockRequests.length)
-  harness.setHidden(false)
-  await settle()
-  check('keepaliveLockHeldWhileHiddenRunning', harness.lockReleases.length === 1,
-    'the keep-alive lock was not released on return')
-})
-
-// A gesture is the only moment audio and notification permission can be armed.
-scenario('gestureArmsAudioAndPermission', async () => {
-  const harness = createHarness({ notificationPermission: 'default', audioState: 'suspended' })
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  await harness.waitForStream()
-  harness.fireDocument('pointerdown')
-  await settle()
-  check('gestureArmsAudioAndPermission', harness.permissionRequests.count === 1,
-    'permission was not requested on the gesture, count ' + harness.permissionRequests.count)
-  check('gestureArmsAudioAndPermission', harness.audioContext !== null && harness.audioContext.resumeCalls === 1,
-    'audio was not resumed on the gesture')
-  harness.fireDocument('pointerdown')
-  await settle()
-  check('gestureArmsAudioAndPermission', harness.permissionRequests.count === 1,
-    'permission was requested more than once')
-})
-
-// Compaction keeps its own watermark, independent of rounds.
-scenario('compactionAlertsOncePerEnd', async () => {
-  const harness = createHarness()
-  harness.load()
-  harness.emit('api-session/added', summary(MAIN))
-  const { stream } = await harness.waitForStream()
-  stream.push({ type: 'snapshot', records: [] })
-  stream.push({ type: 'event', event: { type: 'compaction/start', seq: 11, time: Date.now(), data: {} } })
-  stream.push(compactionEnd(12, Date.now()))
-  await settle()
-  check('compactionAlertsOncePerEnd', harness.notifications.length === 1,
-    'expected one compaction alert, got ' + harness.notifications.length)
-  check('compactionAlertsOncePerEnd', harness.notifications[0].title.includes('compacted'),
-    'unexpected title ' + harness.notifications[0].title)
-  stream.push(compactionEnd(12, Date.now()))
-  await settle()
-  check('compactionAlertsOncePerEnd', harness.notifications.length === 1,
-    'a replayed compaction/end alerted again')
-})
+// ---------------------------------------------------------------------------
 
 for (const { name, run } of scenarios) {
   try {

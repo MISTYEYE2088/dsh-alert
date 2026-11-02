@@ -1,49 +1,72 @@
 # dsh-alert
 
-A DeepSeek Harness web plugin that tells you when the agent is done.
+Desktop notifications and a sound for DeepSeek Harness — raised by the **Harness
+process**, not by a browser tab.
 
-When an agent round finishes, fails, or a context compaction completes, `dsh-alert`
-posts a system notification, plays a short two-note tone, and marks the tab title
-while the tab is in the background — so you can leave the page and still be told
-when your agent needs you again.
+When an agent round finishes, fails, or a context compaction completes,
+`dsh-alert` pops a native notification and plays the system notification sound.
+It keeps working with no browser tab open, ten tabs open, a background tab the
+browser throttled, and a tab that was closed an hour ago.
 
-```text
-round complete   ✓  rising two-note tone   · notification "DSH · Round complete"
-round failed     ✗  falling two-note tone  · notification with the error message
-context compacted  ✓  rising tone          · notification "DSH · Context compacted"
-```
+| Event | Alert |
+| --- | --- |
+| Round completed | "DSH · Round complete" + notification sound |
+| Round failed | "DSH · Round failed" + the error message |
+| Context compacted | "DSH · Context compacted" |
+| Compaction failed | "DSH · Compaction failed" + the error message |
+| Round cancelled by you | silent by default (`alertOnAborted` turns it on) |
+| Subagent round | always silent |
 
-Nothing leaves your machine: no network calls, no telemetry. The plugin only reads
-session events the Harness already sends to the browser.
+Nothing leaves your machine: no network calls, no telemetry, no push service.
 
 ---
+
+## Why the Host process
+
+Notifications used to come from the page, which meant the page had to be awake,
+audible, and allowed to beep. That is exactly what a background tab is not: a
+hidden tab is throttled, may be frozen outright, and a Web Audio context stays
+`suspended` until a user gesture, so tones queued in the background were heard
+only on return to the tab.
+
+The Harness already emits every round boundary to the Host process, so the alert
+is raised there instead:
+
+- one alert per round, no matter how many tabs are open (a single process sees
+  each committed event once);
+- background, frozen, or closed tabs change nothing;
+- no notification permission prompt, no autoplay policy, no user gesture — a
+  process is not a page.
+
+The browser half still does the one thing only a page can: it counts finished
+rounds in the tab title so a returning user sees what happened while away.
 
 ## Requirements
 
 - A DeepSeek Harness **source checkout** running the **web** profile
   (`pnpm dsh web`), version `0.2.0-rc.2` or compatible.
-  The `npx`/registry install cannot load out-of-tree plugins.
-- A Chromium-based browser or Firefox on the same machine.
-- Node 22.19+ or Node 24+ for the checkout itself (the plugin adds no dependencies).
+  A registry (`npx`) install cannot load out-of-tree plugins.
+- Node 22.19+ or Node 24+ for the checkout. The plugin adds **no dependencies**.
+- Windows 10/11, macOS, or Linux — see [Platforms](#platforms).
 
 ## Install
 
 ```powershell
-# 1. Clone somewhere stable (this directory becomes the plugin package)
+# 1. Clone somewhere stable
 git clone https://github.com/MISTYEYE2088/dsh-alert.git C:\portable_software\dsh\dsh-alert
 
-# 2. Install it into the web profile (this forwards to pnpm inside the profile
-#    and adds the row to the profile's bundle list)
+# 2. Install it into the web profile
 cd C:\portable_software\dsh\deepseek-harness
 pnpm dsh plugin --profile web add C:\portable_software\dsh\dsh-alert
 
-# 3. Restart the web server: a new plugin row is a host-tree change
+# 3. Restart: a new plugin row is a host-tree change
 pnpm dsh web
 ```
 
-Then open the token URL the server prints and reload the page.
+The Host half takes effect on that restart; the browser half is picked up when
+you reload the page.
 
-### Manual install (if `dsh plugin add` is unavailable)
+### Manual install
 
 `~/.dsh/profiles/web/package.json` must name the plugin in both places:
 
@@ -64,174 +87,138 @@ Then run `pnpm install` inside `~/.dsh/profiles/web` and restart the web server.
 The plugin's own `cordis.patch.yml` inserts the row; the bundle list is what makes
 the Harness read that file.
 
-## First run: arm sound and notifications
+## Verify
 
-Browsers only allow a page to resume audio and to ask for notification permission
-**in response to a user gesture**. `dsh-alert` therefore arms itself on your first
-click or keypress inside the page, and prints what it got:
+The Host half announces itself in the server log:
 
 ```text
-[dsh-alert] active 0.2.0 { audio: 'suspended', notification: 'default', keepalive: true }
-[dsh-alert] audio armed
-[dsh-alert] notification permission = granted
+[dsh-alert] active { platform: 'win32', notify: true, sound: true, compaction: true, aborted: false }
 ```
 
-Click once anywhere in the page and both lines appear. If you never click, the
-notification is still attempted but the browser will refuse the permission prompt.
+Send yourself one real notification without an agent round:
 
-You can also arm it by hand from the browser console:
-
-```js
-dshAlert.arm()      // request permission + resume audio
-dshAlert.status()   // current state: audio, permission, watched sessions, alerts
-dshAlert.test(true) // fire a sample failure alert right now
+```powershell
+cd C:\portable_software\dsh\dsh-alert
+node tools/probe-os.mjs            # success variant
+node tools/probe-os.mjs --failed   # failure variant, different sound
 ```
 
-## Verify that it works
+Then run a real prompt and switch to another window — the notification should
+arrive while the tab is untouched.
 
-1. Open the browser console and confirm `[dsh-alert] active 0.2.0`.
-2. Run `dshAlert.test()` — a notification and a tone should follow.
-3. Send a real prompt, switch to another window, wait for the round to end, and
-   confirm the notification arrives **while the tab is in the background**.
+## Configuration
 
-If step 3 only fires when you come back to the tab, read
-[Background tabs](#background-tabs-what-is-guaranteed) before filing a bug.
+Options are Cordis row config. Set them on the plugin row in your profile patch
+(`~/.dsh/profiles/web/cordis.patch.yml`):
 
-## Background tabs: what is guaranteed
+```yaml
+- id: dsh-alert
+  name: dsh-alert
+  config:
+    sound: false
+    alertOnCompaction: false
+```
 
-This is the part that used to be unreliable, and browsers make it a real
-constraint rather than a bug in the plugin.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch; `false` mounts nothing |
+| `notify` | `true` | Show the desktop notification |
+| `sound` | `true` | Play the notification sound |
+| `alertOnCompaction` | `true` | Announce context compaction |
+| `alertOnAborted` | `false` | Announce rounds you cancelled yourself |
+| `titlePrefix` | `"DSH"` | Prefix of the notification title |
 
-Nothing in the Harness stops sending session events to a hidden tab: `running`
-arrives on the existing WebSocket push and the session store flushes on
-microtasks, so no data is lost when the page is in the background. What fails is
-page-side scheduling — work queued on `requestAnimationFrame` never runs in a
-hidden tab, and chained `setTimeout` calls get clamped to once a minute. The 0.2.0
-rewrite therefore schedules nothing on a frame, keeps its one fallback timer a
-single fresh timeout, and adds the mitigations below.
-
-| Situation | What `dsh-alert` does |
-| --- | --- |
-| Tab visible, alert fires | notification + tone, immediately |
-| Tab hidden, page still running | notification + tone, immediately |
-| Tab hidden, Chrome *froze* the page | nothing can run; the alert fires the moment the page resumes, once, with the tab-title mark restored |
-| Several rounds finish while you are away | one alert per round, no duplicates |
-| Page reloaded or HMR re-ran the plugin | no alert for a round you were already told about |
-
-What the plugin does to keep the hidden tab alive and audible:
-
-- **Arms audio on your first gesture.** A Web Audio context created without a
-  gesture stays `suspended`, and tones scheduled against it are heard only when it
-  resumes — which is exactly when you return to the tab. That was the original
-  "it only beeps when I refocus" symptom.
-- **Never queues tones on a suspended context.** A silent alert stays silent and
-  says so in the console, instead of becoming a startle when you come back.
-- **Holds a Web Lock while hidden with work in flight.** Chrome does not freeze
-  pages that hold one. The lock is released the moment the tab is visible again or
-  nothing is running, so an idle tab costs nothing.
-- **Marks the tab title** (`(2) DeepSeek Harness`) while alerts are unread, and
-  restores it when you return.
-- **Reconciles on every resume path** — `visibilitychange`, `focus`, `pageshow`,
-  `resume`, and a Harness `connection/reset` — against a durable per-session
-  watermark, so an edge that was missed while frozen is still reported once.
-
-If your browser still freezes the tab, the alert is delivered on return. To avoid
-that, keep the tab in its own window (or exclude the origin from your browser's
-memory saver). `dshAlert.keepalive(false)` disables the Web Lock.
-
-### Why not a service worker or Web Push?
-
-The "notify me even with no page open at all" trick is the Push API plus a service
-worker: the site registers a push subscription, an external push service (FCM,
-Mozilla autopush) wakes the worker, and the worker shows the notification. It is
-the wrong tool here:
-
-- the subscription is bound to an external push service with VAPID keys and an
-  internet path, while a Harness web profile is a machine-local server;
-- it solves "no page is open", not this plugin's problem, which is "the page is
-  open but the browser is throttling it";
-- it still needs the user's explicit permission, and a plugin that asks for a
-  permanent push channel in order to beep on localhost deserves the suspicion that
-  pattern has earned.
-
-If you need a signal that is independent of the browser tab, the *Host* half of a
-plugin can subscribe in Node to `agent/status`, `agent/error`, or `session/event`
-and filter `turn/end` (whose `data.reason` carries `completed` / `error` /
-`aborted`), then raise an OS notification. That works even when the tab is frozen
-or closed. `dsh-alert` stays in the browser so the alert follows the tab you are
-actually using; open an issue if you want the Host-side channel as an option.
+`DSH_ALERT_DRY_RUN=1` in the server environment logs what would be announced
+instead of touching the desktop — useful when testing a profile.
 
 ## How it works
 
-`dsh-alert` has no UI and no React: it subscribes to the session events the
-Harness forwards to every browser client, at the client root, once per page load.
+The Host half subscribes to `session/event`, the post-commit append feed of every
+session log, filters the two events that mean something to a user, and hands the
+text to `notifier.js`:
 
-| Event | Used for |
-| --- | --- |
-| `api-session/added` | session identity, `origin` (subagent vs main), working directory |
-| `api-session/status` | the running → idle edge that fires an alert |
-| `api-session/error` | why the round is failing, shown in the notification |
-| `api-session/removed` | drop that session's watcher and state |
-| `session.follow` snapshot/stream | `compaction/start`/`compaction/end`, and the `turn/end` reason |
-| `connection/reset` | re-open the follow streams after a reconnect |
+| Session event | `data` | Decision |
+| --- | --- | --- |
+| `turn/end` | `reason.kind: 'completed'` | announce "Round complete" |
+| `turn/end` | `reason.kind: 'error'` (`error.message`) | announce "Round failed" + message |
+| `turn/end` | `reason.kind: 'aborted'` | silent unless `alertOnAborted` |
+| `turn/end` | `'blocked'`, `'interrupted'`, `'forked'` | silent — the turn never ran, or the log closed it on resume/fork |
+| `compaction/end` | `error?: string` | announce compacted / failed |
 
-Each session's progress is recorded in `localStorage` under
-`dsh-alert/v1/marks` (`turnSeq`, `compactSeq`, plus the time of the last report).
-That watermark is what makes alerts exactly-once:
+Every session is filtered by `session.header.origin`: `'subagent'` sessions are
+skipped, so a spawned worker finishing never pings you. Alerts are deduplicated
+per session id, event type, and `seq`, so one committed event produces one
+notification even if the loader re-applies the plugin.
 
-- a live `turn/end` reports the round with its real outcome;
-- the status edge is a 500 ms fallback for a session with no usable stream;
-- a follow snapshot that reconnects is compared against the watermark, so a
-  replayed tail never alerts twice, while a round that finished during a freeze is
-  still reported;
-- the first time a session is ever seen, its tail is adopted as a baseline instead
-  of being announced, so opening the app never replays yesterday's rounds.
+### The browser half
 
-Subagent sessions are ignored: a spawned worker finishing is not your turn.
+`client.js` listens to `api-session/added` / `api-session/status` /
+`api-session/error` and, while the tab is hidden, prefixes the tab title with the
+number of finished rounds (`(2) DeepSeek Harness`), restoring it when you return.
+It posts no notification and plays no sound — that would double every Host alert.
+It needs no permissions and no user gesture.
+
+## Platforms
+
+| Platform | Notification | Sound |
+| --- | --- | --- |
+| **Windows 10/11** | PowerShell 5.1 + `Windows.UI.Notifications` toast → Action Center | the toast's own notification sound; a system sound if the toast API fails |
+| **macOS** | `osascript -e 'display notification …'` | `sound name Glass` / `Basso` |
+| **Linux** | `notify-send` | `paplay` with a freedesktop sound, if installed |
+| anything else | log only, with one warning | none |
+
+Windows shows the toast under **PowerShell's** registered AppUserModelID: Windows
+only renders a toast for an AUMID that a Start-menu shortcut owns, and a plugin
+must not install shortcuts behind your back. The toast body is still the alert
+text. Focus Assist, notification settings, and a muted system sound can all
+suppress it — that is a Windows setting, not a plugin failure.
 
 ## Troubleshooting
 
-Open the browser console; every decision is logged under `[dsh-alert]`.
-
 | Symptom | Cause and fix |
 | --- | --- |
-| No `[dsh-alert] active` line | The plugin row is not composed. Re-run `dsh plugin --profile web add <path>`, restart `pnpm dsh web`, reload with a fresh token URL. |
-| `notification permission is default` | The permission prompt was never raised by a gesture. Click once in the page, or call `dshAlert.arm()`. |
-| `notification permission is denied` | Site settings blocked it: allow notifications for `127.0.0.1:3080` and reload. The tone still works. |
-| `audio is still suspended` | Same gesture requirement. Click once inside the page. |
-| `a hidden tab may be frozen` / `navigator.locks unavailable` | The page is not a secure context or the browser lacks Web Locks; keep-alive is off, alerts still work while the page runs. |
-| `status for an unknown session …` | The Host never announced that session, so the plugin cannot tell a main session from a subagent and stays quiet. Reload with a fresh token URL; report it if it persists. |
-| Alert arrives only after you return to the tab | The tab was frozen or the alert fired before your first gesture. See [Background tabs](#background-tabs-what-is-guaranteed). |
-| Two alerts for one round (older versions) | Fixed in 0.2.0 by the watermark; if you see it, run `node tools/smoke.mjs` and include the output. |
+| No `[dsh-alert] active` line in the server log | The row is not composed. Re-run `dsh plugin --profile web add <path>`, restart `pnpm dsh web`. |
+| `[dsh-alert] … exited with 1: …` | The OS helper refused. On Windows the message is the toast API's own text; on Linux install `notify-send` / `libnotify-bin`. |
+| `no OS notifier for platform …` | Unsupported OS: alerts are log-only. Open an issue. |
+| Toast appears but the sound does not | Windows notification sound is muted in Settings → System → Notifications. |
+| No notification while a round ends | Check `enabled` / `notify` in the row config, and that the round actually committed a `turn/end` (a cancelled round is silent by default). |
+| Subagent rounds are silent | By design. |
+| Tab title shows `(1)` after you return | The mark clears on the next `visibilitychange`/focus; call `dshAlert.clear()` in the console to force it. |
 
-To silence it temporarily, remove the row or run `dsh plugin --profile web remove dsh-alert`
-followed by `pnpm install` in the profile and a restart.
+Removing the plugin: `dsh plugin --profile web remove dsh-alert`, then
+`pnpm install` in the profile directory and restart.
 
 ## Development
 
 ```powershell
-node --check client.js     # client.js must parse as a classic script
-node tools/smoke.mjs       # 13 scenarios: one alert per round, replays, catch-up,
-                           # subagents, gesture arming, keep-alive lock, compactions
+node --check index.js && node --check notifier.js && node --check client.js
+npm test          # 27 scenarios: event mapping, config, escaping, title mark
+npm run test:boot # mount in a REAL Cordis context (needs a DSH checkout)
+npm run test:os   # one real desktop notification
 ```
 
-`client.js` is **not** an ES module. The Host concatenates every plugin's client
-artifact into one classic `<script>` response, so a single top-level `import` or
-`export` breaks the whole batch with a `SyntaxError` that the boot error blames on
-an unrelated module. Keep the file as one
-`window.__ModuleLoader__.load({ id, factory })` registration, and keep the logic
-inside the factory.
+`npm run test:boot` is the important one. The DSH loader treats a plugin that
+cannot be imported or applied as a **fatal startup error**, so a malformed row
+costs the user their whole profile instead of one missing feature. The check boots
+the plugin inside a real Cordis `Context`:
 
-The smoke harness runs the real `client.js` against a hand-built browser
-(`Notification`, `AudioContext`, `localStorage`, a controllable `document.hidden`)
-and a fake Cordis context, then asserts how many alerts each sequence produces. It
-does **not** prove that your browser will deliver a notification or play a tone —
-only a real page can prove that.
+```powershell
+node tools/boot-check.mjs "C:\portable_software\dsh\deepseek-harness\node_modules\@deepseek-ai\cordis"
+```
+
+It already earned its keep: an exported `Config` object of defaults — the natural
+thing to write — makes Cordis call `Config["~standard"].validate(...)` and throw,
+which would have stopped the profile from booting. This package therefore exports
+**no `Config`** and merges the row config itself. Keep it that way, or export a
+real Standard Schema.
+
+`client.js` must stay a **classic script**: the Host concatenates every client
+artifact into one `<script>` response, so one top-level `import`/`export` breaks
+the whole batch with a `SyntaxError` that the boot page blames on another module.
 
 ## License
 
 [MIT](LICENSE).
 
-`dsh-alert` started as a private plugin called `alertone`, built and debugged with
-the DeepSeek Harness plugin guide; the 0.2.0 rewrite fixes the "only alerts when I
-come back to the tab" and duplicate-alert behaviour described above.
+Started as a private plugin (`alertone`) that alerted from the browser page; 0.3.0
+moved the alert to the Host process so it no longer depends on a tab being awake.
