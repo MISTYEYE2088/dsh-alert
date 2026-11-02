@@ -24,12 +24,16 @@
     "client.js",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node tools/smoke.mjs",
     "test:boot": "node tools/boot-check.mjs",
     "test:os": "node tools/probe-os.mjs"
+  },
+  "engines": {
+    "node": ">=22.19"
   },
   "keywords": [
     "dsh-plugin",

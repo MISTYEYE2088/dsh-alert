@@ -49,6 +49,18 @@ rounds in the tab title so a returning user sees what happened while away.
 - Node 22.19+ or Node 24+ for the checkout. The plugin adds **no dependencies**.
 - Windows 10/11, macOS, or Linux — see [Platforms](#platforms).
 
+### Compatibility notes
+
+- **No `peerDependencies` are declared**, deliberately: the Host half imports
+  nothing from DSH (only `node:` built-ins), and DSH range-checks any peer against
+  the running version — declaring one would make every future DSH release need a
+  manual `dsh plugin allow-version` exemption. A package with no peers is never
+  blocked by the compatibility preflight.
+- **No `Config` export**, deliberately: see [Development](#development).
+- **No build step.** Unlike a TypeScript plugin that ships `lib/`, the source here
+  *is* the artifact, so what you read is what the loader imports.
+- `client.js` imports nothing either; it is served as one plain classic script.
+
 ## Install
 
 ```powershell
