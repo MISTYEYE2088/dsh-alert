@@ -1,0 +1,7 @@
+# Profile patch for dsh-alert: insert the plugin row into the composed tree.
+#
+# The row name must equal the package name in package.json; the id is what
+# `dsh plugin remove` and profile overrides address later.
+- insert:
+    - id: dsh-alert
+      name: dsh-alert
